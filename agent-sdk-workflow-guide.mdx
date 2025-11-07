@@ -1,0 +1,552 @@
+---
+title: 'Building Agents with Claude Agent SDK'
+description: 'Learn how to write agents that call multiple tools to automate complex workflows'
+---
+
+## Overview
+
+The Claude Agent SDK enables you to build autonomous agents that can call multiple tools and handle complex workflows. At its core, agents operate in a feedback loop:
+
+**gather context → take action → verify work → repeat**
+
+This guide shows you how to create agents that leverage multiple tools to automate sophisticated workflows.
+
+## Installation
+
+Install the Claude Agent SDK using pip:
+
+```bash
+pip install claude-agent-sdk
+```
+
+**Requirements:**
+- Python 3.10+
+- Node.js
+- Claude Code 2.0.0+: `npm install -g @anthropic-ai/claude-code`
+
+## Core Concepts
+
+### SDK Interfaces
+
+The SDK provides two main interfaces:
+
+1. **`query()`** - Simple async function for single interactions with Claude
+2. **`ClaudeSDKClient`** - Full bidirectional conversations with custom tools and hooks
+
+### Tools as In-Process MCP Servers
+
+Tools in the Claude Agent SDK are implemented as in-process Model Context Protocol (MCP) servers. This approach offers:
+
+- **Better Performance** - No inter-process communication overhead
+- **Easier Debugging** - All code runs in the same process
+- **Simplified Management** - No subprocess orchestration needed
+
+## Creating Your First Multi-Tool Agent
+
+### Step 1: Define Custom Tools
+
+Use the `@tool` decorator to create custom tools:
+
+```python
+from claude_agent_sdk import tool, create_sdk_mcp_server
+
+@tool(
+    name="search_database",
+    description="Search the product database",
+    parameters={"query": str, "category": str}
+)
+async def search_database(args):
+    query = args["query"]
+    category = args["category"]
+
+    # Your search logic here
+    results = perform_search(query, category)
+
+    return {
+        "content": [
+            {"type": "text", "text": f"Found {len(results)} products"}
+        ]
+    }
+
+@tool(
+    name="fetch_inventory",
+    description="Get current inventory levels",
+    parameters={"product_id": str}
+)
+async def fetch_inventory(args):
+    product_id = args["product_id"]
+
+    # Your inventory logic
+    inventory = get_inventory(product_id)
+
+    return {
+        "content": [
+            {"type": "text", "text": f"Stock: {inventory['quantity']} units"}
+        ]
+    }
+
+@tool(
+    name="create_order",
+    description="Create a new order",
+    parameters={"product_id": str, "quantity": int}
+)
+async def create_order(args):
+    product_id = args["product_id"]
+    quantity = args["quantity"]
+
+    # Order creation logic
+    order = place_order(product_id, quantity)
+
+    return {
+        "content": [
+            {"type": "text", "text": f"Order created: {order['id']}"}
+        ]
+    }
+```
+
+### Step 2: Create MCP Server with Multiple Tools
+
+Bundle your tools into an MCP server:
+
+```python
+from claude_agent_sdk import create_sdk_mcp_server
+
+# Create server with all tools
+inventory_server = create_sdk_mcp_server(
+    name="inventory-tools",
+    version="1.0.0",
+    tools=[search_database, fetch_inventory, create_order]
+)
+```
+
+### Step 3: Initialize Agent with Tool Permissions
+
+Configure your agent with the tools and set permissions:
+
+```python
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+
+options = ClaudeAgentOptions(
+    mcp_servers={"inventory": inventory_server},
+    allowed_tools=[
+        "mcp__inventory__search_database",
+        "mcp__inventory__fetch_inventory",
+        "mcp__inventory__create_order"
+    ]
+)
+
+async with ClaudeSDKClient(options=options) as client:
+    # Agent is ready to use multiple tools
+    await client.query("Search for laptops and check inventory")
+
+    async for message in client.receive_response():
+        print(message)
+```
+
+## Workflow Patterns
+
+### Sequential Tool Execution
+
+The agent automatically chains tools based on task requirements:
+
+```python
+async with ClaudeSDKClient(options=options) as client:
+    # This will trigger: search → fetch_inventory → create_order
+    await client.query(
+        "Find gaming laptops under $2000, "
+        "check their inventory, and order 5 units of the best one"
+    )
+
+    async for message in client.receive_response():
+        if message.type == "tool_use":
+            print(f"Using tool: {message.tool_name}")
+        elif message.type == "text":
+            print(f"Response: {message.content}")
+```
+
+### Parallel Tool Execution with Subagents
+
+For independent tasks, use subagents to execute tools in parallel:
+
+```python
+from claude_agent_sdk import task
+
+@task(
+    description="Analyze product data",
+    allowed_tools=["mcp__inventory__search_database"]
+)
+async def analyze_products(category):
+    """Subagent that analyzes products in a category"""
+    pass
+
+@task(
+    description="Check inventory levels",
+    allowed_tools=["mcp__inventory__fetch_inventory"]
+)
+async def check_inventory(product_ids):
+    """Subagent that checks inventory for multiple products"""
+    pass
+
+# Orchestrator agent coordinates subagents
+async with ClaudeSDKClient(options=orchestrator_options) as orchestrator:
+    await orchestrator.query(
+        "Analyze electronics and furniture categories, "
+        "then check inventory for top products in each"
+    )
+
+    # Subagents run in parallel, results aggregated by orchestrator
+    async for message in orchestrator.receive_response():
+        print(message)
+```
+
+## Advanced Multi-Agent Workflows
+
+### Orchestrator Pattern
+
+Build a supervisor agent that delegates to specialized subagents:
+
+```python
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, task
+
+# Define specialized subagents
+@task(description="Research specialist", allowed_tools=["search", "web_fetch"])
+async def research_agent(query):
+    """Gathers information from multiple sources"""
+    pass
+
+@task(description="Analysis specialist", allowed_tools=["calculate", "visualize"])
+async def analysis_agent(data):
+    """Processes and analyzes data"""
+    pass
+
+@task(description="Report specialist", allowed_tools=["format", "export"])
+async def report_agent(analysis):
+    """Generates formatted reports"""
+    pass
+
+# Orchestrator coordinates the workflow
+orchestrator_options = ClaudeAgentOptions(
+    subagents=[research_agent, analysis_agent, report_agent],
+    allowed_tools=["delegate"]
+)
+
+async with ClaudeSDKClient(options=orchestrator_options) as orchestrator:
+    await orchestrator.query(
+        "Research market trends for Q4 2025, "
+        "analyze the data, and generate a report"
+    )
+
+    # Orchestrator manages: research → analysis → report
+    async for message in orchestrator.receive_response():
+        handle_orchestrator_message(message)
+```
+
+### Pipeline Pattern
+
+Chain subagents in a deterministic workflow:
+
+```python
+# Define pipeline stages
+stages = [
+    ("extract", extract_agent, ["file_read", "parse"]),
+    ("transform", transform_agent, ["calculate", "normalize"]),
+    ("load", load_agent, ["database_write", "validate"])
+]
+
+async def run_pipeline(data):
+    result = data
+
+    for stage_name, agent, tools in stages:
+        options = ClaudeAgentOptions(allowed_tools=tools)
+
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(f"Process: {result}")
+
+            async for message in client.receive_response():
+                if message.type == "result":
+                    result = message.content
+                    print(f"{stage_name} complete: {result}")
+
+    return result
+```
+
+## Context Management
+
+### Agentic Search
+
+Agents use file systems and tools intelligently to gather only relevant context:
+
+```python
+@tool(
+    name="search_codebase",
+    description="Search codebase with grep",
+    parameters={"pattern": str, "file_type": str}
+)
+async def search_codebase(args):
+    """Returns only relevant excerpts, not full files"""
+    pattern = args["pattern"]
+    file_type = args["file_type"]
+
+    results = grep_search(pattern, f"*.{file_type}")
+
+    # Return focused results
+    return {
+        "content": [
+            {
+                "type": "text",
+                "text": f"Found {len(results)} matches:\n" +
+                        "\n".join(results[:10])  # Limit context
+            }
+        ]
+    }
+```
+
+### Subagent Context Isolation
+
+Subagents process data and return only summaries to the orchestrator:
+
+```python
+@task(description="Log analyzer", allowed_tools=["file_read", "grep"])
+async def log_analyzer(log_file):
+    """
+    Reads large log file but returns only error summary
+    to prevent context overflow in orchestrator
+    """
+    pass
+
+# Orchestrator receives compact results
+async with ClaudeSDKClient(options=orchestrator_options) as orchestrator:
+    await orchestrator.query("Analyze all error logs from last week")
+
+    # Receives summary, not 1M+ log lines
+    async for message in orchestrator.receive_response():
+        print(message)
+```
+
+## Verification Strategies
+
+### Rule-Based Verification
+
+Add validation tools that agents can use to verify their work:
+
+```python
+@tool(
+    name="validate_output",
+    description="Validate generated output meets requirements",
+    parameters={"output": str, "rules": list}
+)
+async def validate_output(args):
+    output = args["output"]
+    rules = args["rules"]
+
+    violations = []
+    for rule in rules:
+        if not check_rule(output, rule):
+            violations.append(rule)
+
+    if violations:
+        return {
+            "content": [{
+                "type": "text",
+                "text": f"Validation failed: {violations}"
+            }],
+            "isError": True
+        }
+
+    return {
+        "content": [{"type": "text", "text": "Validation passed"}]
+    }
+```
+
+### Visual Verification
+
+For UI work, enable screenshot tools:
+
+```python
+@tool(
+    name="capture_screenshot",
+    description="Capture screenshot of rendered output",
+    parameters={"url": str}
+)
+async def capture_screenshot(args):
+    screenshot = take_screenshot(args["url"])
+
+    return {
+        "content": [
+            {
+                "type": "image",
+                "source": screenshot,
+                "alt": "Rendered output"
+            }
+        ]
+    }
+
+# Agent iterates based on visual feedback
+await client.query(
+    "Build a login form and verify it looks correct"
+)
+```
+
+## Best Practices
+
+### 1. Tool Granularity
+
+Create focused tools with single responsibilities:
+
+```python
+# Good: Focused tools
+@tool("read_user", "Read user data", {"user_id": str})
+async def read_user(args): pass
+
+@tool("update_user", "Update user data", {"user_id": str, "data": dict})
+async def update_user(args): pass
+
+# Avoid: Overly broad tools
+@tool("manage_users", "Do anything with users", {"action": str, "params": dict})
+async def manage_users(args): pass
+```
+
+### 2. Permission Management
+
+Grant minimal necessary permissions:
+
+```python
+# Production: Restrict permissions
+options = ClaudeAgentOptions(
+    mcp_servers={"tools": tool_server},
+    allowed_tools=[
+        "mcp__tools__read_user",    # Allow reads
+        "mcp__tools__search_users"   # Allow searches
+        # Don't allow delete_user in production
+    ]
+)
+```
+
+### 3. Error Handling
+
+Tools should return clear error information:
+
+```python
+@tool("fetch_data", "Fetch external data", {"url": str})
+async def fetch_data(args):
+    try:
+        result = await http_get(args["url"])
+        return {"content": [{"type": "text", "text": result}]}
+    except Exception as e:
+        return {
+            "content": [{
+                "type": "text",
+                "text": f"Error fetching data: {str(e)}"
+            }],
+            "isError": True
+        }
+```
+
+### 4. Subagent Specialization
+
+Design subagents with clear, single purposes:
+
+```python
+# Good: Clear specialization
+@task(description="Email specialist - handles all email operations")
+async def email_agent(): pass
+
+@task(description="Calendar specialist - manages scheduling")
+async def calendar_agent(): pass
+
+# Avoid: Overlapping responsibilities
+@task(description="Handles emails and scheduling")
+async def communication_agent(): pass
+```
+
+## Complete Example: Customer Support Agent
+
+Here's a complete multi-tool workflow for customer support:
+
+```python
+from claude_agent_sdk import (
+    tool, create_sdk_mcp_server,
+    ClaudeAgentOptions, ClaudeSDKClient
+)
+
+# Define support tools
+@tool("search_tickets", "Search support tickets", {"query": str, "status": str})
+async def search_tickets(args):
+    tickets = ticket_db.search(args["query"], args["status"])
+    return {
+        "content": [{"type": "text", "text": format_tickets(tickets)}]
+    }
+
+@tool("get_user_info", "Get customer information", {"user_id": str})
+async def get_user_info(args):
+    user = user_db.get(args["user_id"])
+    return {
+        "content": [{"type": "text", "text": format_user(user)}]
+    }
+
+@tool("check_order_status", "Check order status", {"order_id": str})
+async def check_order_status(args):
+    order = order_db.get(args["order_id"])
+    return {
+        "content": [{"type": "text", "text": format_order(order)}]
+    }
+
+@tool("send_response", "Send response to customer", {"ticket_id": str, "message": str})
+async def send_response(args):
+    ticket_db.add_response(args["ticket_id"], args["message"])
+    return {
+        "content": [{"type": "text", "text": "Response sent"}]
+    }
+
+# Create server
+support_server = create_sdk_mcp_server(
+    name="support-tools",
+    version="1.0.0",
+    tools=[search_tickets, get_user_info, check_order_status, send_response]
+)
+
+# Configure agent
+options = ClaudeAgentOptions(
+    mcp_servers={"support": support_server},
+    allowed_tools=[
+        "mcp__support__search_tickets",
+        "mcp__support__get_user_info",
+        "mcp__support__check_order_status",
+        "mcp__support__send_response"
+    ]
+)
+
+# Run agent
+async def handle_support_request(request):
+    async with ClaudeSDKClient(options=options) as agent:
+        await agent.query(
+            f"Handle this support request: {request}\n"
+            "1. Search for related tickets\n"
+            "2. Get customer information\n"
+            "3. Check any order statuses mentioned\n"
+            "4. Draft and send a helpful response"
+        )
+
+        async for message in agent.receive_response():
+            if message.type == "tool_use":
+                print(f"[Tool] {message.tool_name}")
+            elif message.type == "text":
+                print(f"[Agent] {message.content}")
+
+# Execute
+await handle_support_request(
+    "Customer John Doe (user_id: 12345) is asking about order #98765"
+)
+```
+
+## Next Steps
+
+- Explore [Model Context Protocol (MCP)](https://modelcontextprotocol.io) for standard integrations
+- Learn about [prompt caching](https://docs.anthropic.com/claude/docs/prompt-caching) for performance optimization
+- Review [production deployment best practices](https://docs.anthropic.com/claude/docs/production-best-practices)
+
+## Additional Resources
+
+- [Claude Agent SDK GitHub](https://github.com/anthropics/claude-agent-sdk-python)
+- [Anthropic Documentation](https://docs.anthropic.com)
+- [MCP Documentation](https://modelcontextprotocol.io)
