@@ -11,6 +11,8 @@ on:
 
 permissions:
   issues: write
+  # Lets the keepalive step re-enable this workflow via the API.
+  actions: write
 
 # Optional: add a free CoinGecko "demo" API key as a repo secret named
 # COINGECKO_API_KEY if scheduled runs start getting HTTP 403 (CoinGecko
@@ -142,3 +144,13 @@ jobs:
             --body-file - <<'EOF'
           ${{ steps.report.outputs.body }}
           EOF
+
+      - name: Keep schedule alive
+        # GitHub auto-disables scheduled workflows after 60 days without repo
+        # activity (this happened on 2026-08-15). Re-enabling the workflow via
+        # the API on every run resets that timer, so the schedule survives
+        # quiet periods. Runs even if an earlier step failed.
+        if: always()
+        run: |
+          gh api --method PUT \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/bitcoin-price-peak.yml/enable"
